@@ -6,6 +6,7 @@ from flask_wtf import FlaskForm
 from wtforms import StringField, PasswordField, SubmitField
 from wtforms.validators import InputRequired, Email, Length, EqualTo
 from werkzeug.security import generate_password_hash, check_password_hash
+from itsdangerous import URLSafeTimedSerializer
 from dotenv import load_dotenv
 import os
 
@@ -37,6 +38,8 @@ google = oauth.register(
     client_kwargs={'scope': 'openid email profile'}
 )
 
+# Token Serializer
+serializer = URLSafeTimedSerializer(app.secret_key)
 
 # User model
 class User(db.Model):
@@ -45,7 +48,7 @@ class User(db.Model):
     password = db.Column(db.String(200), nullable=True)  # Nullable for Google users
     name = db.Column(db.String(100), nullable=False)
     profile_pic = db.Column(db.String(200), nullable=True)  # For Google users
-
+    confirmed = db.Column(db.Boolean, default=False)
 
 # Forms
 class SignupForm(FlaskForm):
@@ -56,12 +59,20 @@ class SignupForm(FlaskForm):
         InputRequired(), EqualTo('password', message='Passwords must match')])
     submit = SubmitField('Sign Up')
 
-
 class LoginForm(FlaskForm):
     email = StringField('Email', validators=[InputRequired(), Email()])
     password = PasswordField('Password', validators=[InputRequired()])
     submit = SubmitField('Login')
 
+class ForgotPasswordForm(FlaskForm):
+    email = StringField('Email', validators=[InputRequired(), Email()])
+    submit = SubmitField('Send Reset Link')
+
+class ResetPasswordForm(FlaskForm):
+    password = PasswordField('New Password', validators=[InputRequired(), Length(min=6)])
+    confirm_password = PasswordField('Confirm Password', validators=[
+        InputRequired(), EqualTo('password', message='Passwords must match')])
+    submit = SubmitField('Reset Password')
 
 # Routes
 @app.route('/')
@@ -70,7 +81,6 @@ def index():
     if user:
         return render_template('index.html', user=user)
     return redirect(url_for('login'))
-
 
 @app.route('/signup', methods=['GET', 'POST'])
 def signup():
@@ -84,10 +94,9 @@ def signup():
         )
         db.session.add(new_user)
         db.session.commit()
-        flash('Account created successfully. Please log in.', 'success')
+        flash('Account created successfully. Please confirm your email.', 'success')
         return redirect(url_for('login'))
     return render_template('signup.html', form=form)
-
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -100,22 +109,18 @@ def login():
         flash('Invalid email or password.', 'danger')
     return render_template('login.html', form=form)
 
-
 @app.route('/login/google')
 def login_with_google():
     redirect_uri = url_for('authorize', _external=True)
     return google.authorize_redirect(redirect_uri)
-
 
 @app.route('/authorize')
 def authorize():
     token = google.authorize_access_token()
     user_info = google.get('userinfo').json()
 
-    # Check if user exists in the database
     user = User.query.filter_by(email=user_info['email']).first()
     if not user:
-        # Create a new user for Google signup
         user = User(
             email=user_info['email'],
             name=user_info['name'],
@@ -127,12 +132,39 @@ def authorize():
     session['user'] = {'id': user.id, 'name': user.name, 'email': user.email}
     return redirect(url_for('index'))
 
+@app.route('/forgot_password', methods=['GET', 'POST'])
+def forgot_password():
+    form = ForgotPasswordForm()
+    if form.validate_on_submit():
+        user = User.query.filter_by(email=form.email.data).first()
+        if user:
+            token = serializer.dumps(user.email, salt='password-reset-salt')
+            reset_link = url_for('reset_password', token=token, _external=True)
+            flash(f'Reset link sent to {user.email}. Link: {reset_link}', 'info')
+        else:
+            flash('No account found with that email.', 'danger')
+    return render_template('forgot_password.html', form=form)
+
+@app.route('/reset_password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    form = ResetPasswordForm()
+    try:
+        email = serializer.loads(token, salt='password-reset-salt', max_age=3600)
+        user = User.query.filter_by(email=email).first()
+        if form.validate_on_submit():
+            user.password = generate_password_hash(form.password.data, method='pbkdf2:sha256')
+            db.session.commit()
+            flash('Password reset successfully. Please log in.', 'success')
+            return redirect(url_for('login'))
+    except Exception as e:
+        flash('Invalid or expired token.', 'danger')
+        return redirect(url_for('forgot_password'))
+    return render_template('reset_password.html', form=form)
 
 @app.route('/logout')
 def logout():
     session.pop('user', None)
     return redirect(url_for('index'))
-
 
 # Initialize the database
 with app.app_context():
